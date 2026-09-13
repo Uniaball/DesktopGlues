@@ -11,6 +11,7 @@
 #include "buffer.h"
 #include "texture.h"
 #include <string>
+#include <pthread.h>
 #include <format>
 #include <vector>
 #include <random>
@@ -127,6 +128,12 @@ void glGetIntegerv(GLenum pname, GLint* params) {
         // The emulation table covers the desktop GL 4.2 maximum of 36 slots.
         (*params) = 36;
         break;
+    case GL_UNIFORM_BUFFER_OFFSET_ALIGNMENT: {
+        GLint es_params = 0;
+        GLES.glGetIntegerv(pname, &es_params);
+        (*params) = es_params;
+        break;
+    }
     case GL_MAX_ATOMIC_COUNTER_BUFFER_SIZE: {
         // The "buffer" is an ordinary GLES buffer, so its size is only limited
         // by the driver's SSBO block size. Answer with that instead of the GLES
@@ -334,9 +341,9 @@ static std::string g_probe_version;
 static std::string backend_string(GLenum name, const std::string& probe_copy, const char* what) {
     const GLubyte* live = GLES.glGetString ? GLES.glGetString(name) : nullptr;
     if (live) return reinterpret_cast<const char*>(live);
-    LOG_E("glGetString(%s): the backend returned null, so no context is current on this thread for the GLES "
+    LOG_E("glGetString(%s): the backend returned null, so no context is current on this thread (%zu) for the GLES "
           "library this layer loaded; answering from the bootstrap probe (\"%s\")",
-          what, probe_copy.c_str())
+          what, (size_t)pthread_self(), probe_copy.c_str())
     return probe_copy;
 }
 
