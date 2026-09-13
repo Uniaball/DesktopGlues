@@ -725,6 +725,49 @@ extern "C"
         return egl_eglSwapInterval(dpy, interval);
     }
 
+    // A desktop host (SDL, LWJGL, GLFW passing KHR-style attributes through) may
+    // ask for an ES context with non-ES attributes: EGL_CONTEXT_MAJOR_VERSION,
+    // EGL_CONTEXT_MINOR_VERSION ("3.3") and EGL_CONTEXT_FLAGS_KHR (robustness). A
+    // real GLES driver rejects those -- GLES has no minor-version axis and takes
+    // no EGL context flags -- so the first context request dies with
+    // EGL_NO_CONTEXT, and the host stumbles on without anything current: every
+    // GL query answers from the bootstrap probe and buffer mappings fail. Rewrite
+    // the request to its ES form: keep the client (major) version, drop the
+    // minor and the flags, so the first call itself succeeds.
+    bool rewriteEsContextAttributes(const EGLint* attrib_list, std::vector<EGLint>* rewritten, bool* changed) {
+        *changed = false;
+        rewritten->clear();
+        if (attrib_list == nullptr) return false;
+        EGLint major = 0;
+        bool saw_client_version = false;
+        bool saw_desktop_attr = false;
+        for (size_t i = 0; attrib_list[i] != EGL_NONE; i += 2) {
+            const EGLint attribute = attrib_list[i];
+            const EGLint value = attrib_list[i + 1];
+            if (attribute == EGL_CONTEXT_CLIENT_VERSION) {
+                major = value;
+                saw_client_version = true;
+            } else if (attribute == EGL_CONTEXT_MINOR_VERSION) {
+                // Desktop-only axis; a GLES context has no minor version.
+                saw_desktop_attr = true;
+            } else if (attribute == EGL_CONTEXT_FLAGS_KHR) {
+                // Desktop-only; robustness is not an EGL flag on GLES.
+                saw_desktop_attr = true;
+            } else {
+                rewritten->push_back(attribute);
+                rewritten->push_back(value);
+            }
+        }
+        if (saw_client_version) {
+            rewritten->push_back(EGL_CONTEXT_CLIENT_VERSION);
+            rewritten->push_back(major > 0 ? major : 2);
+        }
+        rewritten->push_back(EGL_NONE);
+        rewritten->push_back(0);
+        *changed = saw_desktop_attr;
+        return true;
+    }
+
     EGL_API EGLContext eglCreateContext(EGLDisplay dpy, EGLConfig config, EGLContext share_context,
                                         const EGLint* attrib_list) {
         LOG_D("eglCreateContext, dpy: %p, config: %p, share_context: %p, "
@@ -738,16 +781,26 @@ extern "C"
             // context -- the enable table, gl_state, the multidraw scratch
             // invalidation -- silently falls back to one shared instance.
             std::lock_guard<std::mutex> lifecycle(context_lifecycle_mutex);
-            EGLContext es_context = egl_eglCreateContext(dpy, config, share_context, attrib_list);
+            std::vector<EGLint> es_attribs;
+            const EGLint* backend_attribs = attrib_list;
+            bool changed = false;
+            if (rewriteEsContextAttributes(attrib_list, &es_attribs, &changed)) {
+                backend_attribs = es_attribs.data();
+                if (changed) {
+                    LOG_W_FORCE("eglCreateContext(ES): rewrote desktop-style attrs [%s] -> [%s]",
+                                describeAttributes(attrib_list).c_str(), describeAttributes(es_attribs).c_str())
+                }
+            }
+            EGLContext es_context = egl_eglCreateContext(dpy, config, share_context, backend_attribs);
             ETRACE("eglCreateContext(ES, dpy=%p, share=%p) -> %p [%s]", dpy, share_context, es_context,
-                   describeAttributes(attrib_list).c_str());
+                   describeAttributes(backend_attribs).c_str());
             if (es_context != EGL_NO_CONTEXT) {
                 MGContext* record = mg_context_create(dpy, es_context, share_context, EGL_OPENGL_ES_API,
                                                       g_gles_caps.major, g_gles_caps.minor, 0, 0);
                 ETRACE("  -> MGContext %llu", record ? record->id : 0ULL);
             } else {
                 LOG_E("eglCreateContext(ES): the backend refused with %s [%s]", mg_egl_error_name(rearmBackendError()),
-                      describeAttributes(attrib_list).c_str())
+                      describeAttributes(backend_attribs).c_str())
             }
             return es_context;
         }
@@ -822,9 +875,35 @@ extern "C"
         // would pay that lock on every frame for output that cannot exist.
         MGContext* before = mg_context_find(ctx);
 #endif
-        const EGLBoolean result = egl_eglMakeCurrent(dpy, draw, read, ctx);
+        EGLBoolean result;
+        const bool keep_binding = ctx == EGL_NO_CONTEXT && g_current_ctx != nullptr && g_current_ctx->display == dpy;
+        if (keep_binding) {
+            // A "release current" on a thread where this layer still has a live,
+            // managed context current on the same display. In this launcher the
+            // release is the tool-window teardown that fires when the primary
+            // window is reused, and the context being released IS the game's:
+            // clearing the driver's binding here leaves the very first GL query
+            // on this thread with nothing current and the session dies in init.
+            // Keep the binding -- any later real (re)bind through this wrapper
+            // replaces it anyway -- and answer EGL_TRUE.
+            LOG_W_FORCE("eglMakeCurrent: kept release (ctx=EGL_NO_CONTEXT) on thread %zu while MGContext %llu is "
+                        "current; the releasing caller reused the game's window, not a dead one",
+                        (size_t)pthread_self(), g_current_ctx->id)
+            result = EGL_TRUE;
+        } else {
+            result = egl_eglMakeCurrent(dpy, draw, read, ctx);
+        }
         ETRACE("eglMakeCurrent(dpy=%p, draw=%p, read=%p, ctx=%p, MGContext=%llu) -> %s", dpy, draw, read, ctx,
                before ? before->id : 0ULL, result == EGL_TRUE ? "ok" : "FAILED");
+        // makeCurrent runs at least once a frame once the app is up; log only the
+        // first success per thread so a healthy session does not spam and a stuck
+        // one still shows that this thread never got a context.
+        static thread_local bool s_first_success = true;
+        if (result == EGL_TRUE && s_first_success) {
+            s_first_success = false;
+            LOG_W_FORCE("eglMakeCurrent(dpy=%p, draw=%p, read=%p, ctx=%p) -> ok on thread %zu", dpy, draw, read, ctx,
+                        (size_t)pthread_self())
+        }
         if (result != EGL_TRUE) {
             // Always logged: a host that ignores this return value goes on to
             // make GL calls with nothing current, and the first thing it hears
@@ -834,8 +913,11 @@ extern "C"
                   dpy, draw, read, ctx, mg_egl_error_name(rearmBackendError()))
         }
         // Only on success: a failed make-current leaves the previous context
-        // current, so re-pointing the record would describe the wrong one.
-        if (result == EGL_TRUE) mg_context_make_current(dpy, draw, read, ctx);
+        // current, so re-pointing the record would describe the wrong one. When
+        // the binding is kept, the record must stay as it is -- the thread still
+        // holds the same context, and running make_current with NO_CONTEXT here
+        // would drop the bookkeeping that the kept release just spared.
+        if (result == EGL_TRUE && !keep_binding) mg_context_make_current(dpy, draw, read, ctx);
         return result;
     }
 
